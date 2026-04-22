@@ -3,12 +3,15 @@ import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
 import * as mcpClient from '../../services/mcp/client.js'
+import * as mcpConfig from '../../services/mcp/config.js'
 import { handleMcpApi } from '../api/mcp.js'
 
 let tmpDir: string
 let projectRoot: string
 let originalConfigDir: string | undefined
 let connectSpy: ReturnType<typeof spyOn> | undefined
+let getClaudeCodeMcpConfigsSpy: ReturnType<typeof spyOn> | undefined
+let reconnectSpy: ReturnType<typeof spyOn> | undefined
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-mcp-test-'))
@@ -65,6 +68,10 @@ describe('MCP API', () => {
   afterEach(async () => {
     connectSpy?.mockRestore()
     connectSpy = undefined
+    getClaudeCodeMcpConfigsSpy?.mockRestore()
+    getClaudeCodeMcpConfigsSpy = undefined
+    reconnectSpy?.mockRestore()
+    reconnectSpy = undefined
     await teardown()
   })
 
@@ -88,6 +95,7 @@ describe('MCP API', () => {
     const createdBody = await createRes.json()
     expect(createdBody.server.name).toBe('chrome-devtools')
     expect(createdBody.server.transport).toBe('stdio')
+    expect(createdBody.server.status).toBe('checking')
 
     const list = makeRequest('GET', `/api/mcp?cwd=${encodeURIComponent(projectRoot)}`)
     const listRes = await handleMcpApi(list.req, list.url, list.segments)
@@ -96,8 +104,32 @@ describe('MCP API', () => {
 
     expect(listBody.servers).toHaveLength(1)
     expect(listBody.servers[0].name).toBe('chrome-devtools')
-    expect(listBody.servers[0].status).toBe('connected')
+    expect(listBody.servers[0].status).toBe('checking')
     expect(listBody.servers[0].config.command).toBe('npx')
+    expect(connectSpy).not.toHaveBeenCalled()
+  })
+
+  it('checks a single server status on demand', async () => {
+    const create = makeRequest('POST', '/api/mcp', {
+      cwd: projectRoot,
+      name: 'deepwiki',
+      scope: 'user',
+      config: {
+        type: 'http',
+        url: 'https://mcp.example.com/mcp',
+        headers: {},
+      },
+    })
+    await handleMcpApi(create.req, create.url, create.segments)
+
+    const status = makeRequest('GET', `/api/mcp/deepwiki/status?cwd=${encodeURIComponent(projectRoot)}`)
+    const statusRes = await handleMcpApi(status.req, status.url, status.segments)
+
+    expect(statusRes.status).toBe(200)
+    const body = await statusRes.json()
+    expect(body.server.name).toBe('deepwiki')
+    expect(body.server.status).toBe('connected')
+    expect(connectSpy).toHaveBeenCalled()
   })
 
   it('updates, toggles, and deletes MCP servers', async () => {
@@ -152,5 +184,50 @@ describe('MCP API', () => {
     const listRes = await handleMcpApi(list.req, list.url, list.segments)
     const listBody = await listRes.json()
     expect(listBody.servers.some((server: { name: string }) => server.name === 'context7')).toBe(false)
+  })
+
+  it('reconnects plugin-scoped MCP servers exposed via the merged server list', async () => {
+    const pluginServerName = 'plugin:telegram:telegram'
+    const pluginServerConfig = {
+      scope: 'dynamic',
+      type: 'stdio',
+      command: 'bun',
+      args: ['run', 'start'],
+      env: {
+        CLAUDE_PLUGIN_ROOT: '/tmp/telegram-plugin',
+      },
+      pluginSource: 'telegram@claude-plugins-official',
+    } as const
+
+    getClaudeCodeMcpConfigsSpy = spyOn(mcpConfig, 'getClaudeCodeMcpConfigs').mockResolvedValue({
+      servers: {
+        [pluginServerName]: pluginServerConfig,
+      },
+      errors: [],
+    })
+
+    reconnectSpy = spyOn(mcpClient, 'reconnectMcpServerImpl').mockResolvedValue({
+      name: pluginServerName,
+      client: {
+        name: pluginServerName,
+        type: 'connected',
+        client: {} as never,
+        capabilities: {},
+        config: pluginServerConfig,
+        cleanup: mock(async () => {}),
+      },
+    })
+
+    const reconnect = makeRequest('POST', `/api/mcp/${encodeURIComponent(pluginServerName)}/reconnect`, {
+      cwd: projectRoot,
+    })
+    const reconnectRes = await handleMcpApi(reconnect.req, reconnect.url, reconnect.segments)
+
+    expect(reconnectRes.status).toBe(200)
+    expect(reconnectSpy).toHaveBeenCalledWith(pluginServerName, pluginServerConfig)
+
+    const body = await reconnectRes.json()
+    expect(body.server.name).toBe(pluginServerName)
+    expect(body.server.scope).toBe('dynamic')
   })
 })

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '../components/shared/Button'
 import { Input } from '../components/shared/Input'
 import { Modal } from '../components/shared/Modal'
@@ -63,6 +63,7 @@ const MCP_GROUP_ORDER: McpGroupKey[] = [
 
 const STATUS_TONE: Record<McpServerRecord['status'], string> = {
   connected: 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20',
+  checking: 'bg-slate-500/10 text-slate-600 border-slate-500/20',
   'needs-auth': 'bg-amber-500/10 text-amber-600 border-amber-500/20',
   failed: 'bg-rose-500/10 text-rose-600 border-rose-500/20',
   disabled: 'bg-[var(--color-surface-hover)] text-[var(--color-text-secondary)] border-[var(--color-border)]',
@@ -228,6 +229,14 @@ function scopeLabel(server: McpServerRecord, t: ReturnType<typeof useTranslation
   return t(`settings.mcp.scope.${group}`)
 }
 
+function getServerIdentityKey(server: Pick<McpServerRecord, 'name' | 'scope' | 'projectPath'>) {
+  if (server.scope === 'local' || server.scope === 'project') {
+    return `${server.scope}:${server.projectPath ?? ''}:${server.name}`
+  }
+
+  return `${server.scope}:${server.name}`
+}
+
 function ToggleSwitch({
   checked,
   disabled,
@@ -382,7 +391,7 @@ function ServerRow({
 }
 
 export function McpSettings() {
-  const { servers, selectedServer, isLoading, error, fetchServers, createServer, updateServer, deleteServer, toggleServer, reconnectServer, selectServer } = useMcpStore()
+  const { servers, selectedServer, isLoading, error, fetchServers, createServer, updateServer, deleteServer, toggleServer, reconnectServer, refreshServerStatus, selectServer } = useMcpStore()
   const addToast = useUIStore((s) => s.addToast)
   const sessions = useSessionStore((s) => s.sessions)
   const activeSessionId = useSessionStore((s) => s.activeSessionId)
@@ -393,9 +402,11 @@ export function McpSettings() {
   const [isDeleting, setIsDeleting] = useState(false)
   const [busyServerName, setBusyServerName] = useState<string | null>(null)
   const [pendingDeleteServer, setPendingDeleteServer] = useState<McpServerRecord | null>(null)
+  const refreshInFlightRef = useRef(new Set<string>())
 
   const activeSession = sessions.find((session) => session.id === activeSessionId)
   const currentWorkDir = activeSession?.workDir || undefined
+  const resolveOperationCwd = (server?: McpServerRecord) => server?.projectPath ?? currentWorkDir
 
   useEffect(() => {
     void fetchServers(undefined, currentWorkDir)
@@ -441,10 +452,55 @@ export function McpSettings() {
     }
   }, [selectedServer])
 
+  useEffect(() => {
+    const pendingServers = servers.filter((server) => (
+      server.enabled &&
+      server.status === 'checking' &&
+      !refreshInFlightRef.current.has(getServerIdentityKey(server))
+    ))
+
+    if (pendingServers.length === 0) return
+
+    let cancelled = false
+    const queue = [...pendingServers]
+    const workerCount = Math.min(2, queue.length)
+
+    const runWorker = async () => {
+      while (!cancelled) {
+        const server = queue.shift()
+        if (!server) return
+
+        const key = getServerIdentityKey(server)
+        refreshInFlightRef.current.add(key)
+        try {
+          const updated = await refreshServerStatus(server, resolveOperationCwd(server))
+          if (cancelled) return
+
+          setView((current) => {
+            if (current.type !== 'details' && current.type !== 'edit') return current
+            if (getServerIdentityKey(current.server) !== key) return current
+            return { ...current, server: updated }
+          })
+        } catch {
+          // Keep passive checks silent. Explicit reconnect remains the action that
+          // surfaces failures to the user.
+        } finally {
+          refreshInFlightRef.current.delete(key)
+        }
+      }
+    }
+
+    void Promise.all(Array.from({ length: workerCount }, () => runWorker()))
+
+    return () => {
+      cancelled = true
+    }
+  }, [servers, refreshServerStatus, currentWorkDir])
+
   const handleToggle = async (server: McpServerRecord) => {
     setBusyServerName(server.name)
     try {
-      const updated = await toggleServer(server.name, undefined)
+      const updated = await toggleServer(server, resolveOperationCwd(server))
       addToast({
         type: 'success',
         message: updated.enabled ? t('settings.mcp.toast.enabled', { name: server.name }) : t('settings.mcp.toast.disabled', { name: server.name }),
@@ -462,7 +518,7 @@ export function McpSettings() {
   const handleReconnect = async (server: McpServerRecord) => {
     setBusyServerName(server.name)
     try {
-      const updated = await reconnectServer(server.name, undefined)
+      const updated = await reconnectServer(server, resolveOperationCwd(server))
       addToast({
         type: updated.status === 'connected' ? 'success' : 'warning',
         message: updated.status === 'connected'
@@ -490,7 +546,7 @@ export function McpSettings() {
     if (!server) return
     setIsDeleting(true)
     try {
-      await deleteServer(server.name, server.scope, undefined)
+      await deleteServer(server, resolveOperationCwd(server))
       addToast({
         type: 'success',
         message: t('settings.mcp.toast.deleted', { name: server.name }),
@@ -508,14 +564,39 @@ export function McpSettings() {
     }
   }
 
+  const deleteModal = (
+    <Modal
+      open={pendingDeleteServer !== null}
+      onClose={() => {
+        if (isDeleting) return
+        setPendingDeleteServer(null)
+      }}
+      title={t('settings.mcp.form.deleteTitle')}
+      footer={(
+        <>
+          <Button variant="ghost" onClick={() => setPendingDeleteServer(null)} disabled={isDeleting}>
+            {t('settings.mcp.form.cancel')}
+          </Button>
+          <Button variant="danger" onClick={confirmDelete} loading={isDeleting}>
+            {t('settings.mcp.form.confirmDelete')}
+          </Button>
+        </>
+      )}
+    >
+      <p className="text-sm leading-6 text-[var(--color-text-secondary)]">
+        {pendingDeleteServer ? t('settings.mcp.form.deleteConfirmBody', { name: pendingDeleteServer.name }) : ''}
+      </p>
+    </Modal>
+  )
+
   const handleSave = async () => {
     if (!isDraftValid(draft)) return
     setIsSaving(true)
     try {
       const payload = buildPayload(draft)
       const saved = view.type === 'edit'
-        ? await updateServer(view.server.name, payload, undefined)
-        : await createServer(draft.name.trim(), payload, undefined)
+        ? await updateServer(view.server, payload, resolveOperationCwd(view.server))
+        : await createServer(draft.name.trim(), payload, currentWorkDir)
 
       addToast({
         type: 'success',
@@ -573,44 +654,47 @@ export function McpSettings() {
   if (view.type === 'details') {
     const server = view.server
     return (
-      <div className="max-w-5xl min-w-0">
-        <button
-          type="button"
-          onClick={() => setView({ type: 'list' })}
-          className="mb-5 inline-flex items-center gap-2 text-sm text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
-        >
-          <span className="material-symbols-outlined text-[18px]">arrow_back</span>
-          {t('settings.mcp.form.back')}
-        </button>
+      <>
+        <div className="max-w-5xl min-w-0">
+          <button
+            type="button"
+            onClick={() => setView({ type: 'list' })}
+            className="mb-5 inline-flex items-center gap-2 text-sm text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
+          >
+            <span className="material-symbols-outlined text-[18px]">arrow_back</span>
+            {t('settings.mcp.form.back')}
+          </button>
 
-        <div className="flex items-start justify-between gap-4 mb-8">
-          <div>
-            <h2 className="text-[2.2rem] font-semibold tracking-[-0.03em] text-[var(--color-text-primary)]">{server.name}</h2>
-            <p className="mt-3 text-base text-[var(--color-text-secondary)]">{server.summary}</p>
+          <div className="flex items-start justify-between gap-4 mb-8">
+            <div>
+              <h2 className="text-[2.2rem] font-semibold tracking-[-0.03em] text-[var(--color-text-primary)]">{server.name}</h2>
+              <p className="mt-3 text-base text-[var(--color-text-secondary)]">{server.summary}</p>
+            </div>
+            {server.canReconnect && (
+              <Button variant="secondary" onClick={() => handleReconnect(server)} loading={busyServerName === server.name}>
+                <span className="material-symbols-outlined text-[16px]">sync</span>
+                {t('settings.mcp.form.reconnect')}
+              </Button>
+            )}
           </div>
-          {server.canReconnect && (
-            <Button variant="secondary" onClick={() => handleReconnect(server)} loading={busyServerName === server.name}>
-              <span className="material-symbols-outlined text-[16px]">sync</span>
-              {t('settings.mcp.form.reconnect')}
-            </Button>
-          )}
+
+          <section className="rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)] p-6">
+            <div className="grid gap-4 md:grid-cols-2">
+              <InfoPair label={t('settings.mcp.form.transport')} value={transportLabel(server.transport, t)} />
+              <InfoPair label={t('settings.mcp.form.scope')} value={scopeLabel(server, t)} />
+              <InfoPair label={t('settings.mcp.form.status')} value={server.statusLabel} />
+              <InfoPair label={t('settings.mcp.form.location')} value={server.configLocation} />
+            </div>
+            <div className="mt-5">
+              <div className="text-sm font-semibold text-[var(--color-text-primary)] mb-2">{t('settings.mcp.form.rawConfig')}</div>
+              <pre className="overflow-x-auto rounded-[var(--radius-lg)] bg-[var(--color-surface-hover)] p-4 text-xs text-[var(--color-text-secondary)]">
+                {JSON.stringify(server.config, null, 2)}
+              </pre>
+            </div>
+          </section>
         </div>
-
-        <section className="rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)] p-6">
-          <div className="grid gap-4 md:grid-cols-2">
-            <InfoPair label={t('settings.mcp.form.transport')} value={transportLabel(server.transport, t)} />
-            <InfoPair label={t('settings.mcp.form.scope')} value={scopeLabel(server, t)} />
-            <InfoPair label={t('settings.mcp.form.status')} value={server.statusLabel} />
-            <InfoPair label={t('settings.mcp.form.location')} value={server.configLocation} />
-          </div>
-          <div className="mt-5">
-            <div className="text-sm font-semibold text-[var(--color-text-primary)] mb-2">{t('settings.mcp.form.rawConfig')}</div>
-            <pre className="overflow-x-auto rounded-[var(--radius-lg)] bg-[var(--color-surface-hover)] p-4 text-xs text-[var(--color-text-secondary)]">
-              {JSON.stringify(server.config, null, 2)}
-            </pre>
-          </div>
-        </section>
-      </div>
+        {deleteModal}
+      </>
     )
   }
 
@@ -621,48 +705,49 @@ export function McpSettings() {
     const isBusy = isSaving || isDeleting
 
     return (
-      <div className="max-w-5xl min-w-0">
-        <button
-          type="button"
-          onClick={() => setView({ type: 'list' })}
-          className="mb-5 inline-flex items-center gap-2 text-sm text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
-        >
-          <span className="material-symbols-outlined text-[18px]">arrow_back</span>
-          {t('settings.mcp.form.back')}
-        </button>
+      <>
+        <div className="max-w-5xl min-w-0">
+          <button
+            type="button"
+            onClick={() => setView({ type: 'list' })}
+            className="mb-5 inline-flex items-center gap-2 text-sm text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
+          >
+            <span className="material-symbols-outlined text-[18px]">arrow_back</span>
+            {t('settings.mcp.form.back')}
+          </button>
 
-        <div className="flex items-start justify-between gap-4 mb-8">
-          <div>
-            <h2 className="text-[2.2rem] font-semibold tracking-[-0.03em] text-[var(--color-text-primary)]">
-              {editing ? t('settings.mcp.form.editTitle', { name: targetServer!.name }) : t('settings.mcp.form.createTitle')}
-            </h2>
-            <p className="mt-3 text-base text-[var(--color-text-secondary)]">
-              {editing ? t('settings.mcp.form.editHint') : t('settings.mcp.form.createHint')}
-            </p>
+          <div className="flex items-start justify-between gap-4 mb-8">
+            <div>
+              <h2 className="text-[2.2rem] font-semibold tracking-[-0.03em] text-[var(--color-text-primary)]">
+                {editing ? t('settings.mcp.form.editTitle', { name: targetServer!.name }) : t('settings.mcp.form.createTitle')}
+              </h2>
+              <p className="mt-3 text-base text-[var(--color-text-secondary)]">
+                {editing ? t('settings.mcp.form.editHint') : t('settings.mcp.form.createHint')}
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3">
+              {editing && targetServer?.canReconnect && (
+                <Button variant="secondary" onClick={() => handleReconnect(targetServer)} loading={busyServerName === targetServer.name}>
+                  <span className="material-symbols-outlined text-[16px]">sync</span>
+                  {t('settings.mcp.form.reconnect')}
+                </Button>
+              )}
+              {editing && targetServer?.canRemove && (
+                <Button
+                  variant="ghost"
+                  className="text-[var(--color-error)] hover:text-[var(--color-error)] hover:bg-[var(--color-error)]/8"
+                  onClick={() => handleDelete(targetServer)}
+                  loading={isDeleting}
+                >
+                  <span className="material-symbols-outlined text-[16px]">delete</span>
+                  {t('settings.mcp.form.uninstall')}
+                </Button>
+              )}
+            </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            {editing && targetServer?.canReconnect && (
-              <Button variant="secondary" onClick={() => handleReconnect(targetServer)} loading={busyServerName === targetServer.name}>
-                <span className="material-symbols-outlined text-[16px]">sync</span>
-                {t('settings.mcp.form.reconnect')}
-              </Button>
-            )}
-            {editing && targetServer?.canRemove && (
-              <Button
-                variant="ghost"
-                className="text-[var(--color-error)] hover:text-[var(--color-error)] hover:bg-[var(--color-error)]/8"
-                onClick={() => handleDelete(targetServer)}
-                loading={isDeleting}
-              >
-                <span className="material-symbols-outlined text-[16px]">delete</span>
-                {t('settings.mcp.form.uninstall')}
-              </Button>
-            )}
-          </div>
-        </div>
-
-        <div className="space-y-4">
+          <div className="space-y-4">
           <section className="rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface)] p-5">
             <Input
               label={t('settings.mcp.form.name')}
@@ -802,7 +887,9 @@ export function McpSettings() {
             </Button>
           </div>
         </div>
-      </div>
+        </div>
+        {deleteModal}
+      </>
     )
   }
 
@@ -882,29 +969,7 @@ export function McpSettings() {
           })}
         </div>
       )}
-
-      <Modal
-        open={pendingDeleteServer !== null}
-        onClose={() => {
-          if (isDeleting) return
-          setPendingDeleteServer(null)
-        }}
-        title={t('settings.mcp.form.deleteTitle')}
-        footer={(
-          <>
-            <Button variant="ghost" onClick={() => setPendingDeleteServer(null)} disabled={isDeleting}>
-              {t('settings.mcp.form.cancel')}
-            </Button>
-            <Button variant="danger" onClick={confirmDelete} loading={isDeleting}>
-              {t('settings.mcp.form.confirmDelete')}
-            </Button>
-          </>
-        )}
-      >
-        <p className="text-sm leading-6 text-[var(--color-text-secondary)]">
-          {pendingDeleteServer ? t('settings.mcp.form.deleteConfirmBody', { name: pendingDeleteServer.name }) : ''}
-        </p>
-      </Modal>
+      {deleteModal}
     </div>
   )
 }
